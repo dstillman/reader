@@ -69,7 +69,9 @@ class Renderer {
 		this._originalPage = originalPage;
 		this._pageIndex = originalPage.id - 1;
 
-		// Extra canvas for snapshotting the original page
+		// Extra canvas for snapshotting the original page. Only allocated when
+		// overlay content is actually painted over the page canvas, since a full
+		// snapshot doubles the memory cost of every rendered page
 		this._snapshotCanvas = document.createElement('canvas');
 		this._snapshotContext = this._snapshotCanvas.getContext('2d');
 
@@ -79,6 +81,11 @@ class Renderer {
 		// Track the last seen source canvas and its size to decide when to recapture
 		this._lastSourceCanvas = null;
 		this._lastSourceSize = { w: 0, h: 0 };
+
+		// Source canvas (and its size) that overlay content was last painted into,
+		// or null if the current source canvas only contains pristine pdf.js output
+		this._paintedCanvas = null;
+		this._paintedSize = { w: 0, h: 0 };
 
 		// Cached render signature to decide when to skip rendering
 		this._lastRenderSignature = null;
@@ -102,6 +109,196 @@ class Renderer {
 
 	_invalidateSignature() {
 		this._lastRenderSignature = null;
+	}
+
+	_freeSnapshot() {
+		this._snapshotCanvas.width = 0;
+		this._snapshotCanvas.height = 0;
+		this._lastSourceCanvas = null;
+		this._lastSourceSize = { w: 0, h: 0 };
+	}
+
+	_positionAffectsPage(position) {
+		if (!position) {
+			return false;
+		}
+		return position.pageIndex === this._pageIndex
+			|| !!position.nextPageRects && position.pageIndex + 1 === this._pageIndex;
+	}
+
+	// Whether _renderCommon() would currently paint anything over the page canvas.
+	// This must return true whenever any of the drawing in _renderCommon() would
+	// produce output for this page -- returning true unnecessarily is safe and just
+	// means keeping a snapshot that isn't needed
+	_needsCanvasPaint() {
+		let layer = this._layer;
+
+		// Annotations (including ones spilling over from the previous page), which
+		// also covers comment icons, selected-annotation outlines, and DOM-based
+		// text annotations
+		let annotations = layer._getPageAnnotations(this._pageIndex) || [];
+		if (annotations.length) {
+			return true;
+		}
+
+		// Text selection
+		if ((layer._selectionRanges || []).some(x => this._positionAffectsPage(x.position))) {
+			return true;
+		}
+
+		// Navigation and Read Aloud highlights
+		if (this._positionAffectsPage(layer._highlightedPosition)
+				|| this._positionAffectsPage(layer._readAloudHighlightedPosition)
+				|| this._positionAffectsPage(layer._readAloudSentenceHighlightedPosition)) {
+			return true;
+		}
+
+		// Focused object outline
+		let focusedObject = layer._focusedObject;
+		if (focusedObject && (focusedObject.pageIndex === this._pageIndex
+				|| this._positionAffectsPage(focusedObject.object && focusedObject.object.position))) {
+			return true;
+		}
+
+		// An in-progress action (moving, resizing, erasing, drawing ink, updating
+		// an annotation range)
+		let action = layer.action;
+		if (action) {
+			if (this._positionAffectsPage(action.position)
+					|| this._positionAffectsPage(action.annotation && action.annotation.position)
+					|| action.annotations && typeof action.annotations.values === 'function'
+						&& Array.from(action.annotations.values()).some(x => this._positionAffectsPage(x.position))
+					|| (action.selectionRanges || []).some(x => this._positionAffectsPage(x.position))) {
+				return true;
+			}
+		}
+
+		return false;
+	}
+
+	// Convert a PDF-space rect to a CSS-pixel rect within the page div
+	_pdfRectToCSSRect(rect) {
+		let viewport = this._originalPage.viewport;
+		let [x1, y1, x2, y2] = viewport.convertToViewportRectangle(rect);
+		return [Math.min(x1, x2), Math.min(y1, y2), Math.max(x1, x2), Math.max(y1, y2)];
+	}
+
+	// Collect the tint rects (citation/matched-link overlays, hover, find results)
+	// that are rendered in the DOM over the page canvas instead of being painted
+	// into it, which would require keeping a full-size snapshot of the canvas
+	_getTintEntries() {
+		let layer = this._layer;
+		let dark = layer._themeColorScheme === 'dark';
+		let entries = [];
+
+		let pushPosition = (position, style) => {
+			let rects;
+			if (position.pageIndex === this._pageIndex) {
+				rects = position.rects;
+			}
+			else if (position.nextPageRects && position.pageIndex + 1 === this._pageIndex) {
+				rects = position.nextPageRects;
+			}
+			if (!rects) {
+				return;
+			}
+			for (let rect of rects) {
+				entries.push({ rect: this._pdfRectToCSSRect(rect), ...style });
+			}
+		};
+
+		// Citation and matched internal-link overlays
+		let pdfPage = layer._pdfPages[this._pageIndex];
+		if (pdfPage && pdfPage.overlays) {
+			let style = {
+				color: '#76c6ff',
+				opacity: dark ? 0.4 : 0.1,
+				blend: dark ? 'lighten' : 'multiply'
+			};
+			for (let overlay of pdfPage.overlays) {
+				if (overlay.type === 'citation' || overlay.type === 'internal-link' && overlay.source === 'matched') {
+					pushPosition(overlay.position, style);
+				}
+			}
+		}
+
+		// Hover
+		if (layer._hover) {
+			pushPosition(layer._hover, {
+				color: '#46b1ff',
+				opacity: dark ? 0.5 : 0.1,
+				blend: dark ? 'lighten' : 'multiply'
+			});
+		}
+
+		// Find results
+		let findController = layer._findController;
+		if (findController
+				&& findController.highlightMatches
+				&& findController._matchesCountTotal
+				&& pdfPage) {
+			let positions = findController.getMatchPositions(this._pageIndex, pdfPage) || [];
+			let selected = findController.selected || {};
+			let radius = 5 / devicePixelRatio;
+			for (let i = 0; i < positions.length; i++) {
+				let current = selected.pageIdx === this._pageIndex && i === selected.matchIdx;
+				if (!current && !findController.state.highlightAll) {
+					continue;
+				}
+				let color = current
+					? (dark ? FIND_RESULT_COLOR_CURRENT_DARK : FIND_RESULT_COLOR_CURRENT_LIGHT)
+					: (dark ? FIND_RESULT_COLOR_ALL_DARK : FIND_RESULT_COLOR_ALL_LIGHT);
+				for (let rect of positions[i].rects) {
+					entries.push({ rect: this._pdfRectToCSSRect(rect), color, radius });
+				}
+			}
+		}
+
+		return entries;
+	}
+
+	_updateTintLayer() {
+		let pageDiv = this._originalPage.div;
+		let doc = pageDiv.ownerDocument;
+		let entries = this._getTintEntries();
+		let layerDiv = pageDiv.querySelector('.overlayTintLayer');
+		if (!entries.length) {
+			if (layerDiv) {
+				layerDiv.remove();
+			}
+			this._lastTintSignature = null;
+			return;
+		}
+		let signature = JSON.stringify(entries);
+		if (signature === this._lastTintSignature && layerDiv) {
+			return;
+		}
+		this._lastTintSignature = signature;
+		if (!layerDiv) {
+			// display: contents, so that the tint divs paint as direct children of
+			// the page div -- a wrapper with its own box would either paint below
+			// the canvas (z-index: auto) or form a stacking context that isolates
+			// the tints' mix-blend-mode from the canvas
+			layerDiv = doc.createElement('div');
+			layerDiv.className = 'overlayTintLayer';
+			layerDiv.style.cssText = 'display: contents;';
+			pageDiv.append(layerDiv);
+		}
+		layerDiv.replaceChildren();
+		for (let entry of entries) {
+			let div = doc.createElement('div');
+			let [x1, y1, x2, y2] = entry.rect;
+			// z-index: 1 with the layer appended after .canvasWrapper (also 1)
+			// paints above the page canvas and below the text layer, matching the
+			// previous canvas painting order
+			div.style.cssText = `position: absolute; z-index: 1; pointer-events: none;`
+				+ `left: ${x1}px; top: ${y1}px; width: ${x2 - x1}px; height: ${y2 - y1}px;`
+				+ `background-color: ${entry.color};`
+				+ (entry.opacity !== undefined ? `opacity: ${entry.opacity};` : '')
+				+ (entry.blend ? `mix-blend-mode: ${entry.blend};` : '')
+				+ (entry.radius ? `border-radius: ${entry.radius}px;` : '');
+			layerDiv.append(div);
+		}
 	}
 
 	// Snapshot if canvas elements or its size changed
@@ -332,18 +529,6 @@ class Renderer {
 		let focused = layer._focusedObject;
 		let focusedSig = focused ? [focused.pageIndex ?? -1, focused.object?.id || ''] : [-1, ''];
 
-		// Hover digest (only if affects this page)
-		let hoverSig = [0];
-		if (layer._hover) {
-			let hp = layer._hover;
-			let affects = (hp.pageIndex === this._pageIndex)
-				|| (!!hp.nextPageRects && hp.pageIndex + 1 === this._pageIndex);
-			if (affects) {
-				let rects = hp.rects || hp.nextPageRects || [];
-				hoverSig = [1, ...this._geomDigestFromRects(rects)];
-			}
-		}
-
 		// Selection ranges digest on this page
 		let selOnThis = (layer._selectionRanges || []).filter(r => r?.position?.pageIndex === this._pageIndex);
 		let selDigest = [selOnThis.length];
@@ -460,40 +645,6 @@ class Renderer {
 			}
 		}
 
-		// Find controller
-		let findSig = [0, 0, -1, -1, 0];
-		if (layer._findController && layer._findController.highlightMatches && layer._pdfPages?.[this._pageIndex]) {
-			let fc = layer._findController;
-			let selected = fc.selected || {};
-			let positions = fc.getMatchPositions
-				? (fc.getMatchPositions(this._pageIndex, layer._pdfPages[this._pageIndex]) || [])
-				: [];
-			findSig = [
-				fc._matchesCountTotal || 0,
-				fc.state?.highlightAll ? 1 : 0,
-				selected.pageIdx ?? -1,
-				selected.matchIdx ?? -1,
-				positions.length
-			];
-		}
-
-		// Overlays we draw with a combined rect digest
-		let pageData = layer._pdfPages?.[this._pageIndex];
-		let overlaysSig = [0];
-		if (pageData?.overlays) {
-			let overlays = pageData.overlays.filter(o =>
-				o && (o.type === 'citation' || (o.type === 'internal-link' && o.source === 'matched'))
-			);
-			let rects = [];
-			for (let o of overlays) {
-				let p = o.position;
-				if (!p) continue;
-				if (Array.isArray(p.rects)) rects.push(...p.rects);
-				if (Array.isArray(p.nextPageRects)) rects.push(...p.nextPageRects);
-			}
-			overlaysSig = [overlays.length, ...this._geomDigestFromRects(rects)];
-		}
-
 		// Highlighted position digest
 		let highlightedSig = [0];
 		let hp = layer._highlightedPosition;
@@ -562,15 +713,12 @@ class Renderer {
 			// theme/flags/style
 			theme, readOnly ? 1 : 0, focusColor, fontFamily,
 
-			// selection/hover/action/find/overlays/highlight
+			// selection/action/highlight
 			selectedIds, ...focusedSig,
-			...hoverSig,
 			...selDigest,
 			toolType, toolColor,
 			...actionSig,
 			...actionSelSig,
-			...findSig,
-			...overlaysSig,
 			...highlightedSig,
 			...readAloudSig,
 			...readAloudSentenceSig,
@@ -578,74 +726,6 @@ class Renderer {
 			// annotations
 			'#', ...annSigs.flat()
 		]);
-	}
-
-	_drawHover() {
-		if (!this._layer._hover || !this._context) return;
-		let color = '#46b1ff';
-		this._context.save();
-		if (this._layer._themeColorScheme === 'light') {
-			this._context.globalAlpha = 0.1;
-			this._context.globalCompositeOperation = 'multiply';
-		}
-		else {
-			this._context.globalAlpha = 0.5;
-			this._context.globalCompositeOperation = 'lighten';
-		}
-		this._context.fillStyle = color;
-
-		let position = this._layer._hover;
-		position = this._p2v(position);
-		let rects;
-		if (position.pageIndex === this._pageIndex) {
-			rects = position.rects;
-		}
-		else if (position.nextPageRects && position.pageIndex + 1 === this._pageIndex) {
-			rects = position.nextPageRects;
-		}
-
-		if (rects) {
-			for (let rect of rects) {
-				this._context.fillRect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
-			}
-		}
-
-		this._context.restore();
-	}
-
-	_drawOverlays() {
-		if (!this._layer._pdfPages[this._pageIndex] || !this._context) return;
-
-		let color = '#76c6ff';
-		this._context.save();
-		if (this._layer._themeColorScheme === 'light') {
-			this._context.globalAlpha = 0.1;
-			this._context.globalCompositeOperation = 'multiply';
-		}
-		else {
-			this._context.globalAlpha = 0.4;
-			this._context.globalCompositeOperation = 'lighten';
-		}
-		this._context.fillStyle = color;
-
-		for (let overlay of this._layer._pdfPages[this._pageIndex].overlays) {
-			if (!(overlay.type === 'citation' || overlay.type === 'internal-link' && overlay.source === 'matched')) {
-				continue;
-			}
-			let { position } = overlay;
-			position = this._p2v(position);
-			let rects = position.rects;
-			if (position.nextPageRects && position.pageIndex + 1 === this._pageIndex) {
-				rects = position.nextPageRects;
-			}
-			else if (position.pageIndex !== this._pageIndex) {
-				continue;
-			}
-			for (let rect of rects) {
-				this._context.fillRect(rect[0], rect[1], rect[2] - rect[0], rect[3] - rect[1]);
-			}
-		}
-		this._context.restore();
 	}
 
 	_drawNoteIcon(ctx, color) {
@@ -868,70 +948,6 @@ class Renderer {
 		this._context.restore();
 	}
 
-	_drawFindResults() {
-		if (!this._layer._findController
-			|| !this._layer._findController.highlightMatches
-			|| !this._layer._findController._matchesCountTotal
-			|| !this._layer._pdfPages[this._pageIndex]
-			|| !this._context
-		) {
-			return;
-		}
-		let { selected } = this._layer._findController;
-		let positions = this._layer._findController.getMatchPositions(
-			this._pageIndex,
-			this._layer._pdfPages[this._pageIndex]
-		);
-
-		if (!positions || !positions.length) {
-			return;
-		}
-
-		this._context.save();
-
-		for (let i = 0; i < positions.length; i++) {
-			let position = positions[i];
-			if (selected.pageIdx === this._pageIndex && i === selected.matchIdx) {
-				this._context.fillStyle = this._layer._themeColorScheme === 'dark'
-					? FIND_RESULT_COLOR_CURRENT_DARK
-					: FIND_RESULT_COLOR_CURRENT_LIGHT;
-			}
-			else {
-				if (!this._layer._findController.state.highlightAll) {
-					continue;
-				}
-				this._context.fillStyle = this._layer._themeColorScheme === 'dark'
-					? FIND_RESULT_COLOR_ALL_DARK
-					: FIND_RESULT_COLOR_ALL_LIGHT;
-			}
-
-			position = this._p2v(position);
-			for (let rect of position.rects) {
-				let cornerRadius = 5;
-				let x = rect[0];
-				let y = rect[1];
-				let width = rect[2] - rect[0];
-				let height = rect[3] - rect[1];
-
-				this._context.beginPath();
-				this._context.moveTo(x + cornerRadius, y);
-				this._context.lineTo(x + width - cornerRadius, y);
-				this._context.quadraticCurveTo(x + width, y, x + width, y + cornerRadius);
-				this._context.lineTo(x + width, y + height - cornerRadius);
-				this._context.quadraticCurveTo(x + width, y + height, x + width - cornerRadius, y + height);
-				this._context.lineTo(x + cornerRadius, y + height);
-				this._context.quadraticCurveTo(x, y + height, x, y + height - cornerRadius);
-				this._context.lineTo(x, y + cornerRadius);
-				this._context.quadraticCurveTo(x, y, x + cornerRadius, y);
-				this._context.closePath();
-
-				this._context.fill();
-			}
-		}
-
-		this._context.restore();
-	}
-
 	_renderCommon() {
 		if (!this._context || this._isRendering) {
 			return;
@@ -1086,9 +1102,6 @@ class Renderer {
 			}
 
 			this._drawCommentIcons(annotations);
-			this._drawOverlays();
-			this._drawHover();
-			this._drawFindResults();
 
 			// Focused object outline
 			let focusedObject = this._layer._focusedObject;
@@ -1470,21 +1483,70 @@ class Renderer {
 			return;
 		}
 
+		// Update the DOM-based tint layer (citation/link overlays, hover, find
+		// results), which doesn't touch the canvas
+		if (!this._isDetailView) {
+			this._updateTintLayer();
+		}
+
 		// Ensure we draw into the correct target context first
 		this._initContext();
+		if (!this._context) {
+			return;
+		}
 
-		// Single place to decide and refresh snapshot if source identity or size changed
+		let sourceCanvas = this._getSourceCanvas();
+		// If pdf.js rendered into a new canvas, or re-rendered into the same canvas
+		// after a resize, the canvas is back to pristine page pixels
+		if (this._paintedCanvas
+				&& (this._paintedCanvas !== sourceCanvas
+					|| this._paintedSize.w !== sourceCanvas.width
+					|| this._paintedSize.h !== sourceCanvas.height)) {
+			this._paintedCanvas = null;
+		}
+
+		let needsPaint = this._needsCanvasPaint();
+
+		// Nothing to paint over a pristine canvas -- skip the snapshot entirely so
+		// that pages without overlay content don't pay for a copy of their canvas
+		if (!needsPaint && !this._paintedCanvas) {
+			if (this._snapshotCanvas.width) {
+				this._freeSnapshot();
+			}
+			this._lastRenderSignature = null;
+			return;
+		}
+
+		// Take or refresh the snapshot before the first paint, while the canvas
+		// still contains pristine pdf.js output
 		this._maybeRefreshSnapshot();
+
+		// If overlay content just went away, do a final pass to restore the
+		// pristine pixels (and remove any DOM-based text annotations), bypassing
+		// the signature check
+		let cleanupPass = !needsPaint;
 
 		// Decide if pixels would change, but always render if we are actively drawing ink
 		let signature = this._buildRenderSignature();
 		let forceWhileDrawingInk = this._layer?.action?.type === 'ink' && !!this._layer?.action?.annotation;
-		if (!forceWhileDrawingInk && this._lastRenderSignature === signature) {
+		if (!forceWhileDrawingInk && !cleanupPass && this._lastRenderSignature === signature) {
 			return;
 		}
 
 		this._renderCommon();
-		this._lastRenderSignature = signature;
+
+		if (cleanupPass) {
+			// The canvas is back to pristine page pixels, so the snapshot isn't
+			// needed anymore
+			this._paintedCanvas = null;
+			this._freeSnapshot();
+			this._lastRenderSignature = null;
+		}
+		else {
+			this._paintedCanvas = sourceCanvas;
+			this._paintedSize = { w: sourceCanvas.width, h: sourceCanvas.height };
+			this._lastRenderSignature = signature;
+		}
 	}
 
 	renderAnnotationOnCanvas(annotation, canvas) {
@@ -1554,6 +1616,12 @@ class Renderer {
 			this._drawNoteIcon(ctx, annotation.color);
 		}
 		else if (annotation.type === 'image') {
+			// The snapshot always exists here, because pages with annotations are
+			// always snapshotted before painting, but make sure to avoid drawing
+			// an empty canvas below
+			if (!this._snapshotCanvas.width) {
+				this._maybeRefreshSnapshot();
+			}
 			ctx.globalAlpha = 0.5;
 			ctx.globalCompositeOperation = 'multiply';
 			ctx.fillStyle = annotation.color;
